@@ -63,8 +63,8 @@ Drop the folder in `ComfyUI/custom_nodes/` and restart. At startup you'll
 just see:
 
 ```
-h3_motion_context: nodes registered. ComfyUI is not modified; the layout
-checks run on the first use of a Motion Context node.
+cd custom_nodes
+git clone https://github.com/DragonDiffusionbyBoyo/Boyo-ComfyUI-H3-Motion-Context-enhanced.git
 ```
 
 Having the pack installed changes nothing about your other H3 workflows,
