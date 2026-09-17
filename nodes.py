@@ -33,11 +33,16 @@ import gc
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 
 import comfy.utils
 import folder_paths
 import node_helpers
+import numpy as np
 import torch
+from PIL import Image
 
 try:
     from safetensors.torch import load_file as _st_load, save_file as _st_save
@@ -59,8 +64,8 @@ def _ensure_layout_ok():
     """Prove ComfyUI still places anchors the way this pack needs, once.
 
     This used to install two runtime patches. ComfyUI 0.33 does natively
-    what they existed to do, so the node now builds plain keyframe dicts
-    and only has to check that the arithmetic behind them still holds. See
+    what they existed to do, so the node now builds plain keyframe dicts and
+    only has to check that the arithmetic behind them still holds. See
     layout_contract.py for what is checked and why it is not free.
 
     Run on first use rather than at import, same as the patches were: the
@@ -931,8 +936,122 @@ def _clear_clip_slots(latent_path):
     return removed
 
 
+# --- Boyo fork: approve-gated video saving ---------------------------------
+#
+# Cache for the most recently produced VHS Combine output path. Named
+# obscurely and namespaced under a Boyo-specific prefix rather than
+# something generic like _last_clip, so a second H3-chaining fork sharing
+# this ComfyUI process can't collide with it by reaching for the same
+# module attribute name. Holds nothing sensitive, just a filesystem path.
+_BOYO_H3MC_VHSCACHE_7f2a9d = {"path": None}
+
+
+def _boyo_clip_slot_path(folder_path, clip_index, ext):
+    """Numbered slot for an approved clip: clip_00003.mp4.
+
+    Matches the naming convention MiniMaxH3MotionContextSaveLatent already
+    uses for its safetensors slots, so an approved video and its matching
+    latent share the same clip_index across both save mechanisms.
+    """
+    folder = _under_output(folder_path)
+    if not folder:
+        raise FileNotFoundError(
+            "h3_motion_context: folder must stay inside the ComfyUI "
+            "output folder.")
+    os.makedirs(folder, exist_ok=True)
+    idx = int(clip_index)
+    if idx <= 0:
+        raise ValueError(
+            "h3_motion_context: clip_index must be >= 1 to save an "
+            "approved clip.")
+    return os.path.join(folder, "clip_%05d%s" % (idx, ext))
+
+
+_BOYO_APPROVED_CLIP_FILE = re.compile(r"^clip_(\d{5})(\.[A-Za-z0-9]+)$")
+
+# Fixed location, not a widget -- keeps this in one predictable place
+# alongside the latent slots rather than one more folder to configure.
+_BOYO_FRAME_SUBFOLDER = "h3_context/frames"
+
+
+def _boyo_frame_slot_path(clip_index):
+    """Numbered slot for an approved last-frame PNG: frame_00003.png.
+
+    Same numbering as MiniMaxH3MotionContextSaveLatent's clip_index, kept
+    in a fixed subfolder so it never needs its own configuration.
+    """
+    idx = int(clip_index)
+    if idx <= 0:
+        raise ValueError(
+            "h3_motion_context: clip_index must be >= 1 for an approved "
+            "frame slot.")
+    folder = _under_output(_BOYO_FRAME_SUBFOLDER)
+    if not folder:
+        raise FileNotFoundError(
+            "h3_motion_context: frame folder must stay inside the "
+            "ComfyUI output folder.")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "frame_%05d.png" % idx)
+
+
+def _boyo_list_output_subfolders():
+    """Immediate subfolders of the ComfyUI output directory, sorted
+    alphabetically, for the Folder Concatenate node's folder dropdown.
+
+    This list is captured whenever ComfyUI (re)builds this node's
+    definition -- on startup, or a manual "reload custom nodes" / canvas
+    refresh -- not on every graph execution. A folder created after that
+    point will not appear in the dropdown until the next reload. Restart
+    ComfyUI or refresh node definitions if a folder you just created
+    with H3 Approve Save is missing from the list.
+    """
+    try:
+        root = folder_paths.get_output_directory()
+        names = sorted(
+            name for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+        )
+    except OSError:
+        names = []
+    return names or ["(no folders found in output/ yet)"]
+
+
+def _boyo_approved_clips(folder):
+    """Numbered clip files directly inside `folder`, in clip order.
+
+    Returns a list of (clip_index, path) tuples. Raises ValueError if
+    the folder contains more than one file extension among matches --
+    ffmpeg's concat demuxer stream-copies without re-encoding, which
+    only works when every input shares the same codec and container,
+    and a mixed folder is the most likely way that assumption breaks.
+    """
+    entries = []
+    exts = set()
+    for name in os.listdir(folder):
+        m = _BOYO_APPROVED_CLIP_FILE.match(name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        ext = m.group(2).lower()
+        exts.add(ext)
+        entries.append((idx, os.path.join(folder, name)))
+    if not entries:
+        raise ValueError(
+            "h3_motion_context: no approved clips (clip_00001.mp4 and so "
+            "on) found in %s. Approve or Chain some clips into this "
+            "folder first." % folder)
+    if len(exts) > 1:
+        raise ValueError(
+            "h3_motion_context: folder has mixed clip formats (%s). "
+            "Stream-copy concatenation needs every clip to share the "
+            "same codec and container. Re-save this chain's clips with "
+            "one consistent format." % ", ".join(sorted(exts)))
+    entries.sort(key=lambda t: t[0])
+    return entries
+
+
 def register_chain_routes():
-    """POST slot_exists / clear_latents for the Chain node's start and Clear."""
+    """POST routes for the Chain node's start, Clear, and approve-save."""
     try:
         from aiohttp import web
         from server import PromptServer
@@ -958,6 +1077,42 @@ def register_chain_routes():
         data = await request.json()
         n = _clear_clip_slots(data.get("latent_path") or "h3_context")
         return web.json_response({"removed": n})
+
+    # Boyo fork: promote VHS Combine's cached output into a numbered chain
+    # slot. Route path is namespaced under boyonodes_h3mc/ rather than
+    # h3_motion_context/ so it can't collide with another fork's routes
+    # sharing this same ComfyUI process.
+    @server.routes.post("/boyonodes_h3mc/approve_save")
+    @require_same_origin
+    async def _boyo_approve_save_route(request):
+        data = await request.json()
+        src = _BOYO_H3MC_VHSCACHE_7f2a9d.get("path")
+        if not src:
+            _LOG.warning("boyo-h3mc: approve_save called with no cached "
+                         "VHS output yet")
+            return web.json_response(
+                {"ok": False, "error": "no cached VHS output yet"},
+                status=409)
+        if not os.path.isfile(src):
+            _LOG.warning("boyo-h3mc: cached VHS output no longer on disk: %s",
+                        src)
+            return web.json_response(
+                {"ok": False, "error": "cached VHS output no longer on "
+                                       "disk: %s" % src},
+                status=409)
+        try:
+            dest = _boyo_clip_slot_path(
+                data.get("folder") or "h3_context/approved",
+                data.get("clip_index") or 0,
+                os.path.splitext(src)[1] or ".mp4")
+        except (FileNotFoundError, ValueError) as exc:
+            _LOG.warning("boyo-h3mc: approve_save rejected: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)},
+                                     status=400)
+        shutil.copy2(src, dest)
+        _LOG.info("boyo-h3mc: approved clip %s saved to %s (from %s)",
+                  data.get("clip_index"), dest, src)
+        return web.json_response({"ok": True, "path": dest})
 
     register_chain_routes._done = True
 
@@ -1185,12 +1340,418 @@ class MiniMaxH3MotionContextChain:
         return ()
 
 
+class BoyoH3ApproveSave:
+    """Cache VHS Combine's output path for the Chain node to promote.
+
+    No disk I/O happens in this node. VHS Combine has already produced a
+    file at fixed, hardwired encode settings -- our only job is
+    remembering where it landed so the Chain node's Approve/Chain click
+    can copy it into a numbered chain slot BEFORE Load/Save indices
+    advance and the next clip is queued. That ordering is what guarantees
+    the clip promoted is the one you just reviewed, not whatever the next
+    render produces.
+
+    Wire this after VHS Combine (save_output can stay off -- this uses
+    whatever VHS wrote to its temp folder). Runs on every execution,
+    including rejected Re-rolls: caching a path costs nothing, and
+    nothing reaches the output folder unless Approve or Chain is clicked
+    on the Chain node.
+
+    OUTPUT_NODE = True is required here even though this is a pure
+    passthrough: its `filenames` output isn't wired onward to anything,
+    and ComfyUI prunes nodes that don't feed an OUTPUT_NODE from the
+    execution graph. Without this flag the node is silently skipped and
+    the cache below is never populated, which surfaces two steps
+    downstream as "no cached VHS output yet" on Approve -- a confusing
+    place to discover that this node never ran at all.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "filenames": ("VHS_FILENAMES", {
+                    "tooltip": "Wire from VHS Combine's Filenames output. "
+                               "save_output can stay off. Per VHS's own "
+                               "docs the LAST path in the list is its "
+                               "most complete output (audio-muxed if this "
+                               "clip has sound), which is what gets "
+                               "promoted on Approve/Chain."}),
+            },
+        }
+
+    RETURN_TYPES = ("VHS_FILENAMES",)
+    RETURN_NAMES = ("filenames",)
+    FUNCTION = "execute"
+    OUTPUT_NODE = True
+    CATEGORY = "BoyoNodes/H3"
+    DESCRIPTION = ("Remembers VHS Combine's output path for the Chain "
+                   "node's Approve/Chain buttons to promote into a "
+                   "numbered chain slot. Passthrough only -- no file I/O "
+                   "happens here.")
+
+    def execute(self, filenames):
+        try:
+            _saved_flag, paths = filenames
+        except (TypeError, ValueError):
+            raise ValueError(
+                "h3_motion_context: filenames is not a VHS_FILENAMES "
+                "tuple. Wire this from VHS Combine's Filenames output.")
+        if not paths:
+            raise ValueError(
+                "h3_motion_context: VHS Combine reported no output files.")
+        # per VHS's own docs, the LAST path is its most complete output --
+        # not matched by name, since that naming is VHS's implementation
+        # detail and could change
+        _BOYO_H3MC_VHSCACHE_7f2a9d["path"] = paths[-1]
+        _LOG.info("boyo-h3mc: cached VHS output -> %s", paths[-1])
+        return (filenames,)
+
+
+class BoyoH3FolderConcatenate:
+    """Stitch a folder of approved H3 clips into one file, in clip order.
+
+    Reads clip_00001.mp4, clip_00002.mp4 and so on straight off disk --
+    the same numbered slots H3 Approve Save writes into -- and joins
+    them with ffmpeg's concat demuxer using a stream copy: no decode, no
+    re-encode, no clips loaded into ComfyUI at all. That matters at
+    scale: loading twenty approved clips onto the canvas as IMAGE/AUDIO
+    inputs to join them would mean twenty decoded videos in memory at
+    once, which is exactly the crash this node exists to avoid. Its
+    only inputs are its own widgets; there is nothing to wire.
+
+    Stream-copy concatenation needs every input clip to share the same
+    codec and container, which holds automatically here because every
+    approved clip came out of the same hardwired VHS Combine settings.
+    No crossfade is applied or needed -- continuity across each join
+    already lives in the latent handoff from the chaining nodes, not in
+    the edit.
+
+    Requires ffmpeg on PATH.
+
+    Typical use: build a chain with the rest of the workflow live, then
+    mute or bypass everything except this node and hit ComfyUI's plain
+    Run (not Run/Re-roll -- this node needs no queue management, it is
+    a pure filesystem job), then mute this node again before generating
+    the next chain.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "folder": (_boyo_list_output_subfolders(), {
+                    "tooltip": "A folder directly under the ComfyUI "
+                               "output directory containing approved "
+                               "clips (clip_00001.mp4 and so on), such "
+                               "as one you pointed H3 Approve Save at. "
+                               "This list is captured when ComfyUI "
+                               "builds this node's definition, not live "
+                               "-- restart ComfyUI or refresh node "
+                               "definitions if a folder you just "
+                               "created is missing from it."}),
+                "output_filename": ("STRING", {
+                    "default": "joined",
+                    "tooltip": "Filename for the joined result (no "
+                               "extension needed -- it matches the "
+                               "approved clips' own container). Saved "
+                               "into a 'joined' subfolder of the folder "
+                               "selected above, so approved clips and "
+                               "their joins stay separated."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("joined_path",)
+    FUNCTION = "execute"
+    OUTPUT_NODE = True
+    CATEGORY = "BoyoNodes/H3"
+    DESCRIPTION = ("Joins every approved clip in the selected folder "
+                   "into one file with an ffmpeg stream-copy concat -- "
+                   "no re-encode, no clips loaded onto the canvas. "
+                   "Saves into a 'joined' subfolder alongside the "
+                   "approved clips. Requires ffmpeg on PATH.")
+
+    def execute(self, folder, output_filename):
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError(
+                "h3_motion_context: ffmpeg was not found on PATH. This "
+                "node shells out to ffmpeg for a stream-copy concat; "
+                "install it and make sure it's on PATH.")
+        resolved = _under_output(folder)
+        if not resolved or not os.path.isdir(resolved):
+            raise ValueError(
+                "h3_motion_context: %r is not a folder under the ComfyUI "
+                "output directory. Pick a real folder from the dropdown "
+                "-- if you just created one, refresh node definitions "
+                "or restart ComfyUI so it appears in the list." % folder)
+
+        clips = _boyo_approved_clips(resolved)
+        ext = os.path.splitext(clips[0][1])[1]
+        _LOG.info("boyo-h3mc: concatenating %d clip(s) from %s: %s",
+                  len(clips), resolved,
+                  ", ".join(os.path.basename(p) for _, p in clips))
+
+        dest_dir = os.path.join(resolved, "joined")
+        os.makedirs(dest_dir, exist_ok=True)
+        name = (output_filename or "joined").strip() or "joined"
+        dest_path = os.path.join(dest_dir, name + ext)
+
+        # ffmpeg's concat demuxer wants a manifest file, one input per
+        # line, single-quoted with embedded quotes escaped per its OWN
+        # escaping rule -- this is not shell quoting, it is ffmpeg's
+        # demuxer syntax, and the two are easy to conflate.
+        list_fd, list_path = tempfile.mkstemp(
+            suffix=".txt", prefix="boyo_h3mc_concat_")
+        try:
+            with os.fdopen(list_fd, "w", encoding="utf-8") as f:
+                for _, path in clips:
+                    escaped = path.replace("'", "'\\''")
+                    f.write("file '%s'\n" % escaped)
+
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                   "-i", list_path, "-c", "copy", dest_path]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
+                raise RuntimeError(
+                    "h3_motion_context: ffmpeg concat failed (exit %d). "
+                    "A stream copy needs every clip to share IDENTICAL "
+                    "codec parameters, not just the same extension -- "
+                    "if these clips came from different resolutions or "
+                    "encode settings, that is the most likely cause. "
+                    "ffmpeg's last output:\n%s"
+                    % (proc.returncode, tail))
+        finally:
+            try:
+                os.remove(list_path)
+            except OSError:
+                pass
+
+        _LOG.info("boyo-h3mc: joined %d clip(s) -> %s", len(clips), dest_path)
+        return {"ui": {"text": [
+            "Joined %d clips -> %s" % (len(clips), dest_path)]},
+            "result": (dest_path,)}
+
+
+class BoyoH3SaveApprovedFrame:
+    """Save a clip's last decoded frame to its numbered slot, unconditionally.
+
+    Wire this from wherever you already pull the last frame for manual
+    FFLF feedback -- e.g. VHS Combine's images output fed into a Get
+    Image from Batch node with batch_index -1. Saves on EVERY execution,
+    whether or not the clip goes on to be approved, exactly like H3
+    Motion Context Save Latent does for the latent: nothing reads a slot
+    until the Chain node's Approve/Chain buttons advance the Load index
+    into it, so a rejected clip's frame just sits there, overwritten by
+    the next attempt at that same slot. Gating lives entirely on the
+    LOAD side.
+
+    clip_index is kept in sync with H3 Motion Context Save Latent's own
+    clip_index automatically by the Chain node's buttons -- there is
+    nothing to set by hand, and any manual edit is overwritten before
+    the next render anyway.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {
+                    "tooltip": "This clip's last decoded frame, e.g. "
+                               "from Get Image from Batch (batch_index "
+                               "-1) off VHS Combine's images output."}),
+                "clip_index": ("INT", {
+                    "default": 1, "min": 0, "max": 9999, "step": 1,
+                    "tooltip": "Which clip THIS frame belongs to. Kept "
+                               "in sync with the Save Latent node's "
+                               "clip_index by the Chain node's buttons. "
+                               "0 saves nothing -- there is no previous "
+                               "clip yet."}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = "BoyoNodes/H3"
+    DESCRIPTION = ("Saves this clip's last frame to its numbered slot on "
+                   "every render, gated only by whether Approve/Chain "
+                   "ever advances a Load index far enough to read it.")
+
+    def save(self, image, clip_index=0):
+        idx = int(clip_index)
+        if idx <= 0:
+            _LOG.info("boyo-h3mc: SaveApprovedFrame skipped, clip_index "
+                      "0 (first clip has no previous frame to save)")
+            return ()
+        path = _boyo_frame_slot_path(idx)
+        img = image[-1] if image.ndim == 4 else image
+        arr = (img.clamp(0.0, 1.0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        Image.fromarray(arr).save(path)
+        _LOG.info("boyo-h3mc: saved approved-frame candidate for clip "
+                  "%d -> %s", idx, path)
+        return ()
+
+
+class BoyoH3LoadApprovedFrame:
+    """Load the previous clip's approved last frame, or the real start frame.
+
+    At clip_index 0 (no previous clip yet) this passes initial_frame
+    through unchanged. Otherwise it loads the PNG H3 Save Approved Frame
+    wrote for that clip -- which is only ever a frame from a clip that
+    was actually approved, since Load's index can never reach a slot
+    that Approve/Chain never advanced into.
+
+    clip_index is kept in sync with H3 Motion Context Load Latent's own
+    clip_index automatically by the Chain node's buttons.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "initial_frame": ("IMAGE", {
+                    "tooltip": "Your real starting image. Used only "
+                               "when clip_index is 0."}),
+                "clip_index": ("INT", {
+                    "default": 0, "min": 0, "max": 9999, "step": 1,
+                    "tooltip": "The clip to load the approved last "
+                               "frame FROM. Kept in sync with the Load "
+                               "Latent node's clip_index by the Chain "
+                               "node's buttons. 0 passes initial_frame "
+                               "through unchanged."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "load"
+    CATEGORY = "BoyoNodes/H3"
+    DESCRIPTION = ("Loads the approved last frame of the clip to "
+                   "continue from, falling back to initial_frame when "
+                   "there is no previous clip yet.")
+
+    @classmethod
+    def IS_CHANGED(cls, initial_frame, clip_index=0):
+        # same reasoning as MiniMaxH3MotionContextLoadLatent's
+        # IS_CHANGED: the path string is constant while the file behind
+        # it changes on every re-save of that slot, so cache on the
+        # resolved file's own mtime instead of the path.
+        if int(clip_index) <= 0:
+            return "disabled"
+        try:
+            p = _boyo_frame_slot_path(clip_index)
+            if not os.path.isfile(p):
+                return float("NaN")
+            return "%s:%d" % (p, os.stat(p).st_mtime_ns)
+        except Exception:
+            return float("NaN")
+
+    def load(self, initial_frame, clip_index=0):
+        idx = int(clip_index)
+        if idx <= 0:
+            return (initial_frame,)
+        path = _boyo_frame_slot_path(idx)
+        if not os.path.isfile(path):
+            _LOG.warning(
+                "boyo-h3mc: no approved frame for clip %d at %s; "
+                "falling back to initial_frame", idx, path)
+            return (initial_frame,)
+        img = Image.open(path).convert("RGB")
+        arr = np.asarray(img).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(arr)[None, ...]
+        _LOG.info("boyo-h3mc: loaded approved frame for clip %d from %s",
+                  idx, path)
+        return (tensor,)
+
+
+class BoyoH3PromptSelect:
+    """Pick one pre-drafted prompt chunk by clip_index.
+
+    Write every clip's prompt in one text box, each chunk separated by
+    a line containing only ---. clip_index selects which chunk comes
+    out, using the exact same numbering as the Save Latent node's
+    clip_index -- kept in sync automatically by the Chain node's
+    buttons, so prompt N is always paired with generation N, a Re-roll
+    reuses the same prompt untouched, and a rejected clip's prompt is
+    never skipped past.
+
+    No LLM runs here: this is the deterministic half of prompting a
+    chain. Feed it whatever text an LLM (or you) already drafted --
+    wire a fixed text node in for repeatable testing so an LLM's own
+    variability isn't a second unknown stacked on top of this one.
+
+    Requesting a chunk past the end reuses the LAST chunk instead of
+    erroring, so an unattended Chain run doesn't die mid-sequence over
+    a prompt-count mismatch. A warning is logged when that happens.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "One prompt per clip. Separate chunks "
+                               "with a line containing only ---."}),
+                "clip_index": ("INT", {
+                    "default": 1, "min": 1, "max": 9999, "step": 1,
+                    "tooltip": "Which chunk to output. Kept in sync "
+                               "with the Save Latent node's clip_index "
+                               "by the Chain node's buttons."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("prompt", "info")
+    FUNCTION = "select"
+    CATEGORY = "BoyoNodes/H3"
+    DESCRIPTION = ("Selects one pre-drafted prompt chunk by clip_index "
+                   "from a --- separated text block.")
+
+    @staticmethod
+    def _split(text):
+        lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        chunks, current = [], []
+        for line in lines:
+            if line.strip() == "---":
+                chunks.append("\n".join(current).strip())
+                current = []
+            else:
+                current.append(line)
+        chunks.append("\n".join(current).strip())
+        return [c for c in chunks if c]
+
+    def select(self, text, clip_index=1):
+        chunks = self._split(text)
+        if not chunks:
+            raise ValueError(
+                "h3_motion_context: no prompt chunks found. Separate "
+                "each clip's prompt with a line containing only ---.")
+        idx0 = max(0, int(clip_index) - 1)
+        if idx0 >= len(chunks):
+            _LOG.warning(
+                "boyo-h3mc: clip_index %d has no matching prompt chunk "
+                "(%d written); reusing the last chunk.",
+                clip_index, len(chunks))
+            idx0 = len(chunks) - 1
+        prompt = chunks[idx0]
+        info = "chunk %d/%d" % (idx0 + 1, len(chunks))
+        _LOG.info("boyo-h3mc: prompt select clip %d -> %s", clip_index, info)
+        return (prompt, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContext": MiniMaxH3MotionContext,
     "MiniMaxH3MotionContextTrim": MiniMaxH3MotionContextTrim,
     "MiniMaxH3MotionContextSaveLatent": MiniMaxH3MotionContextSaveLatent,
     "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
     "MiniMaxH3MotionContextChain": MiniMaxH3MotionContextChain,
+    "BoyoH3ApproveSave": BoyoH3ApproveSave,
+    "BoyoH3FolderConcatenate": BoyoH3FolderConcatenate,
+    "BoyoH3SaveApprovedFrame": BoyoH3SaveApprovedFrame,
+    "BoyoH3LoadApprovedFrame": BoyoH3LoadApprovedFrame,
+    "BoyoH3PromptSelect": BoyoH3PromptSelect,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContext": "H3 Motion Context",
@@ -1198,4 +1759,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContextSaveLatent": "H3 Motion Context Save Latent",
     "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
     "MiniMaxH3MotionContextChain": "H3 Motion Context Chain",
+    "BoyoH3ApproveSave": "H3 Approve Save (Boyo)",
+    "BoyoH3FolderConcatenate": "H3 Folder Concatenate (Boyo)",
+    "BoyoH3SaveApprovedFrame": "H3 Save Approved Frame (Boyo)",
+    "BoyoH3LoadApprovedFrame": "H3 Load Approved Frame (Boyo)",
+    "BoyoH3PromptSelect": "H3 Prompt Select (Boyo)",
 }
