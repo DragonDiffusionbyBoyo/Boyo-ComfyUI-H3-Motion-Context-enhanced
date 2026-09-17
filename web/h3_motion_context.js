@@ -14,6 +14,8 @@ const CSS = `
 .h3mc-chain-row button:disabled{opacity:.45;cursor:default;}
 .h3mc-chain-row button.on{border-color:#6f8bbd;background:#1f2a3a;color:#c5d4ee;}
 .h3mc-chain-meta{opacity:.75;font-size:11px;min-height:14px;}
+.boyo-h3mc-row-9f2a{display:flex;gap:6px;}
+.boyo-h3mc-row-9f2a input{flex:1;background:#1a1a1a;color:#ddd;border:1px solid #555;border-radius:4px;padding:4px 6px;font:12px sans-serif;box-sizing:border-box;}
 `;
 
 let cssOnce = false;
@@ -133,36 +135,90 @@ function writeClip(node, value) {
   return true;
 }
 
-function coerceSegments(node) {
-  const w = node?.widgets?.find((x) => x.name === "segments");
-  if (!w) return 0;
-  const n = parseInt(w.value, 10);
-  const v = Number.isFinite(n) && n >= 0 ? n : 0;
-  w.value = v;
-  return v;
-}
-
-function wireSegments(node) {
-  const w = node?.widgets?.find((x) => x.name === "segments");
-  if (!w || w._h3mcSeg) return;
-  w._h3mcSeg = true;
-  const prev = w.serializeValue?.bind(w);
-  w.serializeValue = async function (n, i) {
-    if (prev) {
-      try { await prev(n, i); } catch (e) { /* keep coercing */ }
-    }
-    return coerceSegments(node);
-  };
-  const prevCb = w.callback;
-  w.callback = function () {
-    coerceSegments(node);
-    return prevCb?.apply(this, arguments);
-  };
-  coerceSegments(node);
-}
-
 function readSegments(ctrl) {
-  return coerceSegments(ctrl);
+  return Math.max(0, widgetValue(ctrl, "segments") | 0);
+}
+
+// --- Boyo fork: approve-gated video saving ---------------------------------
+//
+// Obscure, namespaced property key for the state this fork hangs off the
+// Chain node instance, so a second H3-chaining fork sharing the same
+// canvas can't collide with it by reaching for the same property name.
+const BOYO_APPROVESAVE_KEY = "_boyoH3mcApproveSave_9f2a";
+
+// Boyo fork: node types whose clip_index widget mirrors Save's or
+// Load's index automatically, so nothing outside the Load/Save pair
+// keeps a parallel counter that can drift once clips start getting
+// declined.
+const BOYO_SAVE_MIRRORS = ["BoyoH3SaveApprovedFrame", "BoyoH3PromptSelect"];
+const BOYO_LOAD_MIRRORS = ["BoyoH3LoadApprovedFrame"];
+
+function boyoFindSingle(graph, comfyClass) {
+  const matches = graphNodes(graph).filter((n) => n.comfyClass === comfyClass);
+  if (matches.length !== 1) return null;
+  return matches[0];
+}
+
+function syncDependentIndices(ctrl) {
+  const pair = findPair(ctrl);
+  if (!pair) return;
+  const graph = ctrl.graph || app.graph;
+  const saveIdx = readClip(pair.save);
+  const loadIdx = readClip(pair.load);
+  for (const cls of BOYO_SAVE_MIRRORS) {
+    const node = boyoFindSingle(graph, cls);
+    if (node) {
+      writeClip(node, saveIdx);
+    } else {
+      console.log(`[boyo-h3mc] index sync skipped for ${cls}: expected exactly one on the canvas`);
+    }
+  }
+  for (const cls of BOYO_LOAD_MIRRORS) {
+    const node = boyoFindSingle(graph, cls);
+    if (node) {
+      writeClip(node, loadIdx);
+    } else {
+      console.log(`[boyo-h3mc] index sync skipped for ${cls}: expected exactly one on the canvas`);
+    }
+  }
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
+async function boyoApproveSaveClip(ctrl, saveIndex) {
+  const cfg = ctrl[BOYO_APPROVESAVE_KEY];
+  const folder = cfg?.folderInput?.value?.trim();
+  const meta = ctrl._h3mc?.meta;
+  if (!folder) {
+    console.log("[boyo-h3mc] approve_save skipped: no folder set");
+    if (meta) {
+      meta.dataset.boyoSaveStatus = "";
+      paint(ctrl);
+    }
+    return;
+  }
+  console.log(`[boyo-h3mc] approve_save requesting clip_index=${saveIndex} folder=${folder}`);
+  try {
+    const r = await api.fetchApi("/boyonodes_h3mc/approve_save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder, clip_index: saveIndex }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      console.warn(`[boyo-h3mc] approve_save FAILED clip_index=${saveIndex}:`, j.error || r.status);
+      if (meta) meta.dataset.boyoSaveStatus = `save FAILED clip ${saveIndex}: ${j.error || r.status}`;
+    } else {
+      console.log(`[boyo-h3mc] approve_save OK clip_index=${saveIndex} -> ${j.path}`);
+      if (meta) {
+        const shortName = String(j.path).split(/[\\/]/).pop();
+        meta.dataset.boyoSaveStatus = `saved clip ${saveIndex} -> ${shortName}`;
+      }
+    }
+  } catch (e) {
+    console.warn(`[boyo-h3mc] approve_save EXCEPTION clip_index=${saveIndex}:`, e);
+    if (meta) meta.dataset.boyoSaveStatus = `save EXCEPTION clip ${saveIndex}`;
+  }
+  if (meta) paint(ctrl);
 }
 
 function paint(ctrl) {
@@ -183,6 +239,8 @@ function paint(ctrl) {
   } else {
     meta.textContent = `Load ${a} / Save ${b}`;
   }
+  const saveStatus = meta.dataset.boyoSaveStatus;
+  if (saveStatus) meta.textContent += `  |  ${saveStatus}`;
   const chainBtn = ctrl._h3mc.chainBtn;
   if (chainBtn) {
     chainBtn.textContent = ctrl._h3mc.chaining ? "Stop" : "Chain";
@@ -235,7 +293,12 @@ async function startChain(ctrl) {
     await queueOnce(ctrl);
     return true;
   }
+  // Boyo fork: promote the clip currently on Save's slot into the
+  // approved folder BEFORE advancing indices and queuing the next
+  // render. This is the clip you were reviewing when Chain was clicked.
+  await boyoApproveSaveClip(ctrl, save);
   if (!advance(ctrl)) return false;
+  syncDependentIndices(ctrl);
   await queueOnce(ctrl);
   return true;
 }
@@ -271,10 +334,22 @@ function onPromptDone(ok) {
       return;
     }
   }
+  // Boyo fork: one-line insertion. Every clip Chain produces after the
+  // first (which startChain already covers) lands here, not in
+  // startChain, so the auto-save has to happen on this path too or
+  // Chain would only ever save the clip it kicked off. Deliberately NOT
+  // awaited: this is a synchronous event handler off execution_success,
+  // and awaiting here would delay advance()/queueOnce() for the next
+  // clip by however long the copy takes -- a timing change to the loop
+  // that wasn't asked for. Trade-off: a slow save races the next queue.
+  // Watch the console/meta line while probing for signs of that race.
+  const pair = findPair(ctrl);
+  if (pair) boyoApproveSaveClip(ctrl, readClip(pair.save));
   if (!advance(ctrl)) {
     stopChain(ctrl);
     return;
   }
+  syncDependentIndices(ctrl);
   queueOnce(ctrl);
 }
 
@@ -289,7 +364,6 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = onNodeCreated?.apply(this, arguments);
-      wireSegments(this);
       injectCss();
       const root = document.createElement("div");
       root.className = "h3mc-chain";
@@ -301,7 +375,7 @@ app.registerExtension({
       row3.className = "h3mc-chain-row";
       const approve = document.createElement("button");
       approve.textContent = "Approve";
-      approve.title = "Advance Load/Save, then run the next clip.";
+      approve.title = "Save this clip, advance Load/Save, then queue the next clip. Use Approve & Finish if this is the last clip you want.";
       const reroll = document.createElement("button");
       reroll.textContent = "Run/Re-roll";
       reroll.title = "Queue at the current Load/Save indices. Use this instead of ComfyUI's Run button.";
@@ -317,17 +391,46 @@ app.registerExtension({
       row.append(approve, reroll);
       row2.append(chainBtn, resetBtn);
       row3.append(clearBtn);
+
+      // Boyo fork: Approve saves THEN always advances and queues the
+      // next clip -- there is no way to save the last clip of a manual
+      // sequence without also kicking off a clip you didn't want. This
+      // button does the save half only.
+      const row4 = document.createElement("div");
+      row4.className = "h3mc-chain-row";
+      const finishBtn = document.createElement("button");
+      finishBtn.textContent = "Approve & Finish";
+      finishBtn.title = "Save this clip like Approve, but do not advance Load/Save or queue another render. Use this on the last clip you want.";
+      row4.append(finishBtn);
+
+      // Boyo fork: folder input for approve-gated video saving. Blank =
+      // don't save. Sits above the meta line, its own row so it can be
+      // laid out independently of the button rows above it.
+      const boyoFolderRow = document.createElement("div");
+      boyoFolderRow.className = "boyo-h3mc-row-9f2a";
+      const boyoFolderInput = document.createElement("input");
+      boyoFolderInput.type = "text";
+      boyoFolderInput.placeholder = "approved clip folder (blank = don't save)";
+      boyoFolderRow.append(boyoFolderInput);
+
       const meta = document.createElement("div");
       meta.className = "h3mc-chain-meta";
-      root.append(row, row2, row3, meta);
+      root.append(row, row2, row3, row4, boyoFolderRow, meta);
       swallow(root);
       this.addDOMWidget("h3mc_chain", "CHAIN", root, { serialize: false });
       this._h3mc = { chaining: false, awaiting: false, remaining: 0, meta, chainBtn };
+      this[BOYO_APPROVESAVE_KEY] = { folderInput: boyoFolderInput };
       approve.onclick = async (e) => {
         e.stopPropagation();
         if (this._h3mc.awaiting) return;
         stopChain(this);
+        // Boyo fork: promote the clip currently on Save's slot before
+        // advancing indices and queuing the next render, same ordering
+        // guarantee as the Chain button's startChain path.
+        const pair = findPair(this);
+        if (pair) await boyoApproveSaveClip(this, readClip(pair.save));
         if (!advance(this)) return;
+        syncDependentIndices(this);
         await queueOnce(this);
       };
       reroll.onclick = async (e) => {
@@ -335,6 +438,18 @@ app.registerExtension({
         if (this._h3mc.awaiting) return;
         stopChain(this);
         await queueOnce(this);
+      };
+      finishBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (this._h3mc.awaiting) return;
+        stopChain(this);
+        const pair = findPair(this);
+        if (!pair) { paint(this); return; }
+        await boyoApproveSaveClip(this, readClip(pair.save));
+        paint(this);
+        if (this._h3mc?.meta) {
+          this._h3mc.meta.textContent += "  ·  finished (indices unchanged, nothing queued)";
+        }
       };
       chainBtn.onclick = async (e) => {
         e.stopPropagation();
@@ -357,6 +472,10 @@ app.registerExtension({
         if (this._h3mc.awaiting) return;
         stopChain(this);
         resetFirst(this);
+        // Boyo fork: Reset sets Load/Save back to 0/1; the frame (and
+        // later prompt) mirrors need to follow it back down too, or
+        // they'd sit on whatever clip they were last synced to.
+        syncDependentIndices(this);
       };
       clearBtn.onclick = async (e) => {
         e.stopPropagation();
@@ -375,14 +494,8 @@ app.registerExtension({
         }
       };
       paint(this);
-      this.setSize?.([270, 168]);
-      return r;
-    };
-    const onConfigure = nodeType.prototype.onConfigure;
-    nodeType.prototype.onConfigure = function () {
-      const r = onConfigure?.apply(this, arguments);
-      wireSegments(this);
-      coerceSegments(this);
+      syncDependentIndices(this);
+      this.setSize?.([270, 208]);
       return r;
     };
   },
